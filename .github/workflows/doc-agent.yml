@@ -1,8 +1,10 @@
 name: Documentation Synchronization Agent
 
 on:
+  # Weekly cron trigger: runs every Monday at 00:00 UTC
   schedule:
-    - cron: '0 0 * * 1'  # Monday 00:00 UTC
+    - cron: '0 0 * * 1'
+  # Manual trigger: allows dry-run or production mode via workflow_dispatch
   workflow_dispatch:
     inputs:
       dry_run:
@@ -11,22 +13,31 @@ on:
         default: 'true'
         type: boolean
 
-# Upstream release detection: fetchUpstreamChanges polls GitHub API for new releases
-# from openkruise/kruise, openkruise/kruise-game, openkruise/rollouts, and openkruise/kruise-agent
-# during each scheduled run. See scripts/doc-agent/src/tools/fetch-upstream-changes.js
+# UPSTREAM RELEASE DETECTION
+# The fetchUpstreamChanges tool polls GitHub API for new releases from:
+#   - openkruise/kruise
+#   - openkruise/kruise-game
+#   - openkruise/rollouts
+#   - openkruise/kruise-agent
+# This approach avoids webhook/repository_dispatch complexity and keeps polling logic centralized.
+# See: scripts/doc-agent/src/tools/fetch-upstream-changes.js
 
 env:
+  # GitHub token for API access (auto-provided by GitHub Actions)
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+  # Dry-run mode (true=no PRs, just report diffs; false=create draft PRs)
+  # Default: true (safe mode); can be overridden via workflow_dispatch input
   DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
 
 jobs:
   run-doc-agent:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pull-requests: write
+      contents: read          # Read access to repository contents
+      pull-requests: write    # Create draft PRs
     steps:
+      # Prepare runtime environment
       - name: Checkout openkruise/openkruise.io
         uses: actions/checkout@v4
 
@@ -40,6 +51,8 @@ jobs:
         working-directory: scripts/doc-agent
         run: npm install
 
+      
+      # Fetch all changes from upstream repos since last sync
       - name: Fetch upstream changes
         id: fetch
         working-directory: scripts/doc-agent
@@ -49,6 +62,8 @@ jobs:
             --output /tmp/fetch-result.json
           cat /tmp/fetch-result.json >> $GITHUB_STEP_SUMMARY
 
+      
+      # Compare upstream changes against current openkruise.io docs, detect drift
       - name: Detect documentation drift
         id: drift
         working-directory: scripts/doc-agent
@@ -61,6 +76,8 @@ jobs:
           echo "drift_detected=${DRIFT}" >> $GITHUB_OUTPUT
           cat /tmp/drift-result.json >> $GITHUB_STEP_SUMMARY
 
+      
+      # Transform upstream changes to Docusaurus-compliant markdown
       - name: Generate documentation update
         id: generate
         working-directory: scripts/doc-agent
@@ -71,6 +88,8 @@ jobs:
             --output /tmp/generate-result.json
           cat /tmp/generate-result.json >> $GITHUB_STEP_SUMMARY
 
+      
+      # Add metadata: dates, authors, tags, upstream links
       - name: Enrich metadata
         id: enrich
         working-directory: scripts/doc-agent
@@ -81,6 +100,8 @@ jobs:
             --output /tmp/enrich-result.json
           cat /tmp/enrich-result.json >> $GITHUB_STEP_SUMMARY
 
+      
+      # Create draft PR with changes and upstream references
       - name: Create draft PR
         id: pr
         working-directory: scripts/doc-agent
@@ -92,6 +113,7 @@ jobs:
             --output /tmp/pr-result.json
           cat /tmp/pr-result.json >> $GITHUB_STEP_SUMMARY
 
+      # Report drift without creating PRs(dry-run mode)
       - name: Output dry-run summary
         if: env.DRY_RUN == 'true' && success()
         working-directory: scripts/doc-agent
@@ -105,6 +127,8 @@ jobs:
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           fi
 
+      
+      # Ensures visibility into workflow health even on partial failures
       - name: Post structured summary
         if: always()
         run: |
@@ -124,5 +148,5 @@ jobs:
           echo "**Dry Run**: ${{ env.DRY_RUN }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ job.status }}" = "failure" ]; then
-            echo "⚠️ **Run failed with no partial PRs created**" >> $GITHUB_STEP_SUMMARY
+            echo " **Run failed with no partial PRs created**" >> $GITHUB_STEP_SUMMARY
           fi
