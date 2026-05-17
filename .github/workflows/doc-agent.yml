@@ -1,0 +1,128 @@
+name: Documentation Synchronization Agent
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Monday 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run in dry-run mode (no PRs created)'
+        required: false
+        default: 'true'
+        type: boolean
+
+# Upstream release detection: fetchUpstreamChanges polls GitHub API for new releases
+# from openkruise/kruise, openkruise/kruise-game, openkruise/rollouts, and openkruise/kruise-agent
+# during each scheduled run. See scripts/doc-agent/src/tools/fetch-upstream-changes.js
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+  DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+
+jobs:
+  run-doc-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout openkruise/openkruise.io
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        working-directory: scripts/doc-agent
+        run: npm install
+
+      - name: Fetch upstream changes
+        id: fetch
+        working-directory: scripts/doc-agent
+        run: |
+          node src/tools/fetch-upstream-changes.js \
+            --repos openkruise/kruise,openkruise/kruise-game,openkruise/rollouts,openkruise/kruise-agent \
+            --output /tmp/fetch-result.json
+          cat /tmp/fetch-result.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Detect documentation drift
+        id: drift
+        working-directory: scripts/doc-agent
+        if: success()
+        run: |
+          node src/tools/detect-doc-drift.js \
+            --changes /tmp/fetch-result.json \
+            --output /tmp/drift-result.json
+          DRIFT=$(jq -r '.drift_detected' /tmp/drift-result.json)
+          echo "drift_detected=${DRIFT}" >> $GITHUB_OUTPUT
+          cat /tmp/drift-result.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate documentation update
+        id: generate
+        working-directory: scripts/doc-agent
+        if: success() && steps.drift.outputs.drift_detected == 'true' && env.DRY_RUN == 'false'
+        run: |
+          node src/tools/generate-doc-update.js \
+            --changes /tmp/fetch-result.json \
+            --output /tmp/generate-result.json
+          cat /tmp/generate-result.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Enrich metadata
+        id: enrich
+        working-directory: scripts/doc-agent
+        if: success() && steps.generate.outcome == 'success'
+        run: |
+          node src/tools/enrich-metadata.js \
+            --docs /tmp/generate-result.json \
+            --output /tmp/enrich-result.json
+          cat /tmp/enrich-result.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Create draft PR
+        id: pr
+        working-directory: scripts/doc-agent
+        if: success() && steps.enrich.outcome == 'success'
+        run: |
+          node src/tools/create-draft-pr.js \
+            --docs /tmp/enrich-result.json \
+            --upstream-links /tmp/fetch-result.json \
+            --output /tmp/pr-result.json
+          cat /tmp/pr-result.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Output dry-run summary
+        if: env.DRY_RUN == 'true' && success()
+        working-directory: scripts/doc-agent
+        run: |
+          echo "## Documentation Sync: Dry-Run Mode" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/drift-result.json ]; then
+            echo "### Drift Detection Results" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            jq . /tmp/drift-result.json >> $GITHUB_STEP_SUMMARY || cat /tmp/drift-result.json >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post structured summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Fetch upstream changes | ${{ steps.fetch.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Detect drift | ${{ steps.drift.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.drift.outputs.drift_detected }}" = "true" ]; then
+            echo "| Generate update | ${{ steps.generate.outcome }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Enrich metadata | ${{ steps.enrich.outcome }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Create PR | ${{ steps.pr.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry Run**: ${{ env.DRY_RUN }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "failure" ]; then
+            echo "⚠️ **Run failed with no partial PRs created**" >> $GITHUB_STEP_SUMMARY
+          fi
